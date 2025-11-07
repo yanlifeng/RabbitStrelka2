@@ -49,8 +49,17 @@ foreach(THIS_PROGRAM_SOURCE ${THIS_PROGRAM_SOURCE_LIST})
     endif ()
     set(THIS_APPLICATION_LIB ${THIS_PROJECT_NAME}_${THIS_LIBSUFFIX})
     add_executable        (${THIS_PROGRAM} ${THIS_PROGRAM_SOURCE})
+    
+    # Add OpenMP to link libraries if available
+    set(THIS_OPENMP_LIBS "")
+    if (OpenMP_CXX_FOUND)
+        set(THIS_OPENMP_LIBS OpenMP::OpenMP_CXX)
+        message(STATUS "Linking ${THIS_PROGRAM} with OpenMP")
+    endif()
+    
     target_link_libraries (${THIS_PROGRAM}  ${THIS_APPLICATION_LIB} ${PROJECT_PRIMARY_LIBRARY_TARGETS}
                            ${HTSLIB_LIBRARY} ${Boost_LIBRARIES}
+                           ${THIS_OPENMP_LIBS}
                            ${THIS_ADDITIONAL_LIB})
     install(TARGETS ${THIS_PROGRAM} RUNTIME DESTINATION ${THIS_LIBEXECDIR})
 endforeach()

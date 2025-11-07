@@ -53,7 +53,7 @@ include ("${THIS_MACROS_CMAKE}")
 #
 # if true, build with very strict error checking (disabled in src release tarballs)
 #
-set(DEVELOPER_MODE true)
+set(DEVELOPER_MODE false)
 
 #
 # set WIN specific cache values
@@ -137,6 +137,15 @@ else()
 		    " Disabling optional python build and installation components. Installed workflow requires python ${MINIMUM_PYTHON_VERSION} or higher to run.")
         set(PYTHONINTERP_FOUND false)
     endif ()
+endif()
+
+# Find OpenMP
+find_package(OpenMP)
+if (OpenMP_CXX_FOUND)
+    message (STATUS "OpenMP found: ${OpenMP_CXX_VERSION}")
+    message (STATUS "OpenMP CXX flags: ${OpenMP_CXX_FLAGS}")
+else()
+    message (WARNING "OpenMP not found. Parallel processing features will be disabled.")
 endif()
 
 set (TARGET_ARCHITECTURE ${CMAKE_SYSTEM_PROCESSOR})

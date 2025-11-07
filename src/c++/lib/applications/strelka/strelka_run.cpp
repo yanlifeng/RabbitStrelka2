@@ -30,6 +30,12 @@
 #include "starling_common/starling_ref_seq.hh"
 #include "starling_common/starling_pos_processor_util.hh"
 
+// #undef USE_OPENMP
+
+#if USE_OPENMP
+#include <omp.h>
+#endif
+
 
 
 namespace INPUT_TYPE
@@ -213,9 +219,6 @@ strelka_run(
     const bam_hdr_t& referenceHeader(bamHeaders.front());
     const bam_header_info referenceHeaderInfo(referenceHeader);
 
-    strelka_streams fileStreams(opt, dopt, pinfo, referenceHeader, ssi);
-    strelka_pos_processor posProcessor(opt, dopt, ref, fileStreams, statsManager);
-
     // parse and sanity check regions
     assert ((! opt.isHaplotypingEnabled) && "Region border size must be updated if haplotyping is enabled");
     const unsigned supplementalRegionBorderSize(opt.maxIndelSize);
@@ -225,14 +228,111 @@ strelka_run(
     getStrelkaAnalysisRegions(opt, referenceAlignmentFilename, referenceHeaderInfo, supplementalRegionBorderSize,
                               regionInfoList);
 
+    // Log region information
+    log_os << "Total top-level regions to process: " << regionInfoList.size() << "\n";
     for (const auto& regionInfo : regionInfoList)
     {
+        log_os << "Region: " << regionInfo.regionChrom 
+               << ":" << (regionInfo.regionRange.begin_pos()+1) << "-" << regionInfo.regionRange.end_pos()
+               << " (size: " << (regionInfo.regionRange.end_pos() - regionInfo.regionRange.begin_pos()) << " bp)\n";
+    }
+
+#if USE_OPENMP
+    const int max_threads = omp_get_max_threads();
+    const int num_regions = static_cast<int>(regionInfoList.size());
+    if (max_threads > num_regions)
+    {
+        omp_set_num_threads(num_regions);
+    }
+    log_os << "Parallel processing: " << regionInfoList.size() 
+           << " regions, max " << omp_get_max_threads() << " threads\n";
+#else
+    log_os << "Serial processing: " << regionInfoList.size() << " regions\n";
+#endif
+
+    // Process each top-level region in parallel (or serial if OpenMP not compiled)
+    // Each iteration creates fresh data structures to avoid any state carryover
+    #pragma omp parallel for schedule(dynamic)
+    for (size_t regionIdx = 0; regionIdx < regionInfoList.size(); ++regionIdx)
+    {
+        const auto& regionInfo = regionInfoList[regionIdx];
+
+        // Create local copy of options with region-specific output filenames
+        // Use regionIdx instead of thread_id to avoid file overwriting when
+        // a single thread processes multiple regions
+        strelka_options opt_local(opt);
+        
+        // Add region-specific suffixes to output filenames
+        const std::string region_suffix = ".region_" + std::to_string(regionIdx);
+        
+        if (! opt_local.somatic_snv_filename.empty())
+        {
+            opt_local.somatic_snv_filename += region_suffix;
+        }
+        if (! opt_local.somatic_indel_filename.empty())
+        {
+            opt_local.somatic_indel_filename += region_suffix;
+        }
+        if (! opt_local.somatic_callable_filename.empty())
+        {
+            opt_local.somatic_callable_filename += region_suffix;
+        }
+        if (! opt_local.segmentStatsFilename.empty())
+        {
+            opt_local.segmentStatsFilename += region_suffix;
+        }
+        if (! opt_local.realignedReadFilenamePrefix.empty())
+        {
+            opt_local.realignedReadFilenamePrefix += region_suffix;
+        }
+
+        // Create fresh data structures for this region (no reset, no state carryover)
+        RunStatsManager statsManager_local(opt_local.segmentStatsFilename);
+        starling_read_counts readCounts_local;
+        reference_contig_segment ref_local;
+        
+        // Setup streamData
+        HtsMergeStreamer streamData_local(opt_local.referenceFilename);
+        std::vector<std::reference_wrapper<const bam_hdr_t>> bamHeaders_local;
+        {
+            std::vector<unsigned> registrationIndices;
+            for (const bool isTumor : opt_local.alignFileOpt.isAlignmentTumor)
+            {
+                const unsigned rindex(isTumor ? STRELKA_SAMPLE_TYPE::TUMOR : STRELKA_SAMPLE_TYPE::NORMAL);
+                registrationIndices.push_back(rindex);
+            }
+
+            bamHeaders_local = registerAlignments(opt_local.alignFileOpt.alignmentFilenames, registrationIndices, streamData_local);
+
+            assert(not bamHeaders_local.empty());
+            const bam_hdr_t& referenceHeader_local(bamHeaders_local.front());
+
+            static const bool noRequireNormalized(false);
+            registerVcfList(opt_local.input_candidate_indel_vcf, INPUT_TYPE::CANDIDATE_INDELS, referenceHeader_local, streamData_local,
+                            noRequireNormalized);
+            registerVcfList(opt_local.force_output_vcf, INPUT_TYPE::FORCED_GT_VARIANTS, referenceHeader_local, streamData_local);
+            registerVcfList(opt_local.noise_vcf, INPUT_TYPE::NOISE_VARIANTS, referenceHeader_local, streamData_local);
+
+            if (! opt_local.callRegionsBedFilename.empty())
+            {
+                streamData_local.registerBed(opt_local.callRegionsBedFilename.c_str(), INPUT_TYPE::CALL_REGION);
+            }
+        }
+
+        const bam_hdr_t& referenceHeader_local(bamHeaders_local.front());
+        const StrelkaSampleSetSummary ssi_local;
+        strelka_streams fileStreams_local(opt_local, dopt, pinfo, referenceHeader_local, ssi_local);
+        strelka_pos_processor posProcessor_local(opt_local, dopt, ref_local, fileStreams_local, statsManager_local);
+
+        // Process this region (and its subregions if using BED file)
         if (not opt.isUseCallRegions())
         {
-            callRegion(opt, regionInfo, readCounts, ref, streamData, posProcessor);
+            // No BED file: process the single region
+            callRegion(opt_local, regionInfo, readCounts_local, ref_local, streamData_local, posProcessor_local);
         }
         else
         {
+            // With BED file: process subregions sequentially within this top-level region
             std::vector<known_pos_range2> subRegionRanges;
             getSubRegionsFromBedTrack(opt.callRegionsBedFilename, regionInfo.regionChrom, regionInfo.regionRange, subRegionRanges);
 
@@ -241,9 +341,12 @@ strelka_run(
                 AnalysisRegionInfo subRegionInfo;
                 getStrelkaAnalysisRegionInfo(regionInfo.regionChrom, subRegionRange.begin_pos(), subRegionRange.end_pos(),
                                              supplementalRegionBorderSize, subRegionInfo);
-                callRegion(opt, subRegionInfo, readCounts, ref, streamData, posProcessor);
+                
+                callRegion(opt_local, subRegionInfo, readCounts_local, ref_local, streamData_local, posProcessor_local);
             }
         }
+
+        // Flush remaining variants for this region
+        posProcessor_local.reset();
     }
-    posProcessor.reset();
 }
